@@ -1,0 +1,11 @@
+﻿version: '3.8'
+
+services:
+  rollcall-app:
+    build: .
+    container_name: rollcall_face_attendance
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
