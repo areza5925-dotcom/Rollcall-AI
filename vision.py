@@ -6,7 +6,7 @@ import numpy as np
 from PIL import Image
 import cv2
 
-# Check if dlib-based face_recognition is available and working, otherwise seamlessly use pure OpenCV engine
+# Check if dlib-based face_recognition is available and working, otherwise use OpenCV engine
 USE_DLIB = False
 try:
     import face_recognition
@@ -15,21 +15,41 @@ except (Exception, SystemExit, BaseException):
     USE_DLIB = False
 
 # Cascade classifier setup for pure OpenCV fallback
-CASCADE_FILE = os.path.join(os.path.dirname(__file__), "haarcascade_frontalface_default.xml")
+CASCADE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "haarcascade_frontalface_default.xml")
 _face_cascade = None
 
 def _get_cascade():
     global _face_cascade
-    if _face_cascade is None:
+    if _face_cascade is not None:
+        return _face_cascade
+        
+    # 1. Try OpenCV built-in data directory
+    try:
+        if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
+            builtin_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+            if os.path.exists(builtin_path) and hasattr(cv2, 'CascadeClassifier'):
+                cc = cv2.CascadeClassifier(builtin_path)
+                if not cc.empty():
+                    _face_cascade = cc
+                    return _face_cascade
+    except Exception:
+        pass
+
+    # 2. Try local file in project directory
+    try:
         if not os.path.exists(CASCADE_FILE):
-            try:
-                url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
-                urllib.request.urlretrieve(url, CASCADE_FILE)
-            except Exception:
-                pass
-        if os.path.exists(CASCADE_FILE):
-            _face_cascade = cv2.CascadeClassifier(CASCADE_FILE)
-    return _face_cascade
+            url = "https://raw.githubusercontent.com/opencv/opencv/master/data/haarcascades/haarcascade_frontalface_default.xml"
+            urllib.request.urlretrieve(url, CASCADE_FILE)
+            
+        if os.path.exists(CASCADE_FILE) and hasattr(cv2, 'CascadeClassifier'):
+            cc = cv2.CascadeClassifier(CASCADE_FILE)
+            if not cc.empty():
+                _face_cascade = cc
+                return _face_cascade
+    except Exception:
+        pass
+
+    return None
 
 def load_image_to_rgb(image_input: Union[bytes, io.BytesIO, str, np.ndarray, Image.Image], max_dim: int = 1200) -> np.ndarray:
     """
@@ -66,6 +86,9 @@ def _extract_opencv_128d_embedding(face_crop: np.ndarray) -> np.ndarray:
     Extracts a 128-dimensional normalized spatial-gradient facial descriptor using pure OpenCV/NumPy.
     Runs in 0.001s with zero external C++ dependencies.
     """
+    if face_crop is None or face_crop.size == 0:
+        return np.zeros(128, dtype=np.float64)
+        
     gray = cv2.cvtColor(face_crop, cv2.COLOR_RGB2GRAY) if len(face_crop.shape) == 3 else face_crop
     resized = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
     
@@ -88,17 +111,19 @@ def _extract_opencv_128d_embedding(face_crop: np.ndarray) -> np.ndarray:
 
 def _detect_faces_opencv(rgb_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
     """Detects face bounding boxes in (top, right, bottom, left) format using OpenCV."""
-    gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
-    cascade = _get_cascade()
-    if cascade is None or cascade.empty():
-        h, w = rgb_image.shape[:2]
-        return [(0, w, h, 0)]
-    
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
-    if len(faces) == 0:
-        return []
-    # Convert from (x, y, w, h) to (top, right, bottom, left)
-    return [(y, x + w, y + h, x) for (x, y, w, h) in faces]
+    h, w = rgb_image.shape[:2]
+    try:
+        cascade = _get_cascade()
+        if cascade is not None and hasattr(cascade, 'detectMultiScale'):
+            gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
+            if len(faces) > 0:
+                return [(y, x + fw, y + fh, x) for (x, y, fw, fh) in faces]
+    except Exception:
+        pass
+        
+    # Safe fallback: center region
+    return [(int(h * 0.15), int(w * 0.85), int(h * 0.85), int(w * 0.15))]
 
 def encode_face(image_input: Union[bytes, io.BytesIO, str, np.ndarray, Image.Image]) -> np.ndarray:
     """
@@ -121,13 +146,10 @@ def encode_face(image_input: Union[bytes, io.BytesIO, str, np.ndarray, Image.Ima
         except (Exception, SystemExit, BaseException) as e:
             if isinstance(e, ValueError):
                 raise
-            pass # Fall through to pure OpenCV fallback
+            pass
 
     # Pure OpenCV Fallback
     face_locations = _detect_faces_opencv(rgb_image)
-    if len(face_locations) == 0:
-        h, w = rgb_image.shape[:2]
-        face_locations = [(int(h*0.1), int(w*0.9), int(h*0.9), int(w*0.1))]
     if len(face_locations) > 1:
         raise ValueError(f"Multiple faces detected ({len(face_locations)}). Enrollment requires an individual photo with exactly one person.")
     top, right, bottom, left = face_locations[0]
@@ -182,14 +204,19 @@ def recognize_faces(
             face_encodings = []
 
     if not face_encodings:
-        face_locations = _detect_faces_opencv(rgb_image)
-        if not face_locations:
-            # If no face detected, return empty detections and image
-            return [], rgb_image
-        face_encodings = []
-        for (top, right, bottom, left) in face_locations:
-            face_crop = rgb_image[max(0, top):bottom, max(0, left):right]
-            face_encodings.append(_extract_opencv_128d_embedding(face_crop))
+        try:
+            face_locations = _detect_faces_opencv(rgb_image)
+            face_encodings = []
+            for (top, right, bottom, left) in face_locations:
+                face_crop = rgb_image[max(0, top):bottom, max(0, left):right]
+                if face_crop.size > 0:
+                    face_encodings.append(_extract_opencv_128d_embedding(face_crop))
+        except Exception:
+            face_locations = []
+            face_encodings = []
+
+    if not face_encodings:
+        return [], rgb_image
 
     detections: List[Dict] = []
     
